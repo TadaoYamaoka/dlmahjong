@@ -2,8 +2,8 @@ import torch
 from dlmahjong.model import PolicyValueNet
 from cmajiang import (
     Game,
-    game_public_features,
-    game_private_features,
+    public_features,
+    private_features,
     N_CHANNELS_PUBLIC,
     N_CHANNELS_PRIVATE,
 )
@@ -16,16 +16,16 @@ def test_forward():
     game.qipai()
     game.zimo()
 
-    public_featuers = torch.zeros((1, N_CHANNELS_PUBLIC + 4, 9, 4), dtype=torch.float32)
-    private_featuers = torch.zeros((1, N_CHANNELS_PRIVATE, 9, 4), dtype=torch.float32)
-    game_public_features(game, 0, public_featuers.numpy())
-    game_private_features(game, 0, private_featuers.numpy())
+    features1 = torch.zeros((1, N_CHANNELS_PUBLIC + 4, 9, 4), dtype=torch.float32)
+    features2 = torch.zeros((1, N_CHANNELS_PRIVATE, 9, 4), dtype=torch.float32)
+    public_features(game, 0, features1.numpy())
+    private_features(game, 0, features2.numpy())
 
     device = torch.device("cuda")
     model = PolicyValueNet(channels=128, blocks=10, value_blocks=5)
     model.to(device)
     (p, p_aux1, p_aux2, p_aux3), (v, v_aux) = model(
-        public_featuers.to(device), private_featuers.to(device)
+        features1.to(device), features2.to(device)
     )
 
     assert p.shape == (1, 118)

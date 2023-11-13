@@ -24,20 +24,18 @@ class PolicyHead(nn.Module):
     def __init__(self, channels):
         super().__init__()
         # 出力
+        # 鳴かない・ロンしない 1
         # 打牌 34+3(赤牌)
         # 自摸切り 1
+        # 立直 打牌・自摸切り 34+3+1
         # チー 3(パターン) x 2(赤牌有無)
         # ポン 1 x 2(赤牌有無)
         # カン 1
-        # 鳴かない 1
-        # 明槓 34
-        # 加槓 34
-        # 立直 1
-        # 自摸和了 1
-        # ロン 1
+        # 暗槓・加槓 34
+        # 和了 1
 
         self.fc1 = nn.Linear(channels * 9 * 4, 256)
-        self.fc2 = nn.Linear(256, 118)
+        self.fc2 = nn.Linear(256, 121)
 
         # 補助タスク1
         # 役 66(場風・自風はそれぞれ1、翻牌は牌別、ドラと裏ドラはそれぞれ10までカウント)
@@ -54,22 +52,35 @@ class PolicyHead(nn.Module):
         self.fc1_aux3 = nn.Linear(channels * 9 * 4, 256)
         self.fc2_aux3 = nn.Linear(256, 102)
 
-    def forward(self, x):
+    def forward_policy(self, x):
         p = self.fc1(x)
         p = F.relu(p)
         p = self.fc2(p)
+        return p
 
+    def forward_aux1(self, x):
         aux1 = self.fc1_aux1(x)
         aux1 = F.relu(aux1)
         aux1 = self.fc2_aux1(aux1)
+        return aux1
 
+    def forward_aux2(self, x):
         aux2 = self.fc1_aux2(x)
         aux2 = F.relu(aux2)
         aux2 = self.fc2_aux2(aux2)
+        return aux2
 
+    def forward_aux3(self, x):
         aux3 = self.fc1_aux3(x)
         aux3 = F.relu(aux3)
         aux3 = self.fc2_aux3(aux3)
+        return aux3
+
+    def forward(self, x):
+        p = self.forward_policy(x)
+        aux1 = self.forward_aux1(x)
+        aux2 = self.forward_aux2(x)
+        aux3 = self.forward_aux3(x)
 
         return p, aux1, aux2, aux3
 
@@ -151,3 +162,13 @@ class PolicyValueNet(nn.Module):
         v = self.value_head(x1, x2)
 
         return p, v
+
+class PolicyNet(nn.Module):
+    def __init__(self, pv_net):
+        super().__init__()
+        self.pv_net = pv_net
+
+    def forward(self, x):
+        x = self.pv_net.extract_features(x)
+        p = self.pv_net.policy_head.forward_policy(x.flatten(1))
+        return p

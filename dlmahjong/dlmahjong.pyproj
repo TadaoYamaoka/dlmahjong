@@ -23,6 +23,7 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="export_policy.py" />
     <Compile Include="model.py" />
   </ItemGroup>
   <ItemGroup>
