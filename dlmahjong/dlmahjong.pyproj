@@ -25,6 +25,7 @@
   <ItemGroup>
     <Compile Include="export_policy.py" />
     <Compile Include="model.py" />
+    <Compile Include="train.py" />
   </ItemGroup>
   <ItemGroup>
     <InterpreterReference Include="CondaEnv|CondaEnv|mahjong" />
