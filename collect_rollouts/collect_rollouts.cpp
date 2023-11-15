@@ -273,12 +273,17 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
 
 void output_paipu(const std::filesystem::path& path, const int id, const std::vector<Game::Paipu>& paipu_tmp) {
     auto paipu_path = path;
-    paipu_path /= std::to_string(id) + "." + get_current_datetime() + ".paipu";
-    std::ofstream ofs(paipu_path.string(), std::ios::binary);
+    paipu_path /= get_current_datetime() + "." + std::to_string(id) + ".paipu";
+    auto paipu_path_tmp = paipu_path;
+    paipu_path_tmp += ".tmp";
+    std::ofstream ofs(paipu_path_tmp, std::ios::binary);
     if (ofs) {
         for (const auto& paipu_ : paipu_tmp) {
             ofs << paipu_;
         }
+        ofs.close();
+
+        std::filesystem::rename(paipu_path_tmp, paipu_path);
     }
 }
 
