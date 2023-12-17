@@ -36,17 +36,21 @@ constexpr long long int operator"" _MiB(long long unsigned int val)
 
 
 Inference::Inference(const char* filepath, const int max_batch_size) : max_batch_size(max_batch_size) {
-    checkCudaErrors(cudaMalloc((void**)&x_dev, sizeof(public_features_t) * max_batch_size));
-    checkCudaErrors(cudaMalloc((void**)&y_dev, N_ACTIONS * max_batch_size * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&x1_dev, sizeof(public_features_t) * max_batch_size));
+    checkCudaErrors(cudaMalloc((void**)&x2_dev, sizeof(private_features_t) * max_batch_size));
+    checkCudaErrors(cudaMalloc((void**)&y1_dev, N_ACTIONS * max_batch_size * sizeof(float)));
+    checkCudaErrors(cudaMalloc((void**)&y2_dev, max_batch_size * sizeof(float)));
 
-    inputBindings = { x_dev, y_dev };
+    inputBindings = { x1_dev, x2_dev, y1_dev, y2_dev };
 
     load_model(filepath);
 }
 
 Inference::~Inference() {
-    checkCudaErrors(cudaFree(x_dev));
-    checkCudaErrors(cudaFree(y_dev));
+    checkCudaErrors(cudaFree(x1_dev));
+    checkCudaErrors(cudaFree(x2_dev));
+    checkCudaErrors(cudaFree(y1_dev));
+    checkCudaErrors(cudaFree(y2_dev));
 }
 
 void Inference::build(const char* filepath) {
@@ -89,18 +93,23 @@ void Inference::build(const char* filepath) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
     }
 
-    assert(network->getNbInputs() == 1);
-    nvinfer1::Dims inputDims[] = { network->getInput(0)->getDimensions() };
+    assert(network->getNbInputs() == 2);
+    nvinfer1::Dims inputDims[] = { network->getInput(0)->getDimensions(), network->getInput(1)->getDimensions() };
     assert(inputDims[0].nbDims == 4);
+    assert(inputDims[1].nbDims == 4);
 
-    assert(network->getNbOutputs() == 1);
+    assert(network->getNbOutputs() == 2);
 
     // Optimization Profiles
     auto profile = builder->createOptimizationProfile();
     const auto dims1 = inputDims[0].d;
-    profile->setDimensions("input", nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, dims1[1], dims1[2], dims1[3]));
-    profile->setDimensions("input", nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4(max_batch_size, dims1[1], dims1[2], dims1[3]));
-    profile->setDimensions("input", nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4(max_batch_size, dims1[1], dims1[2], dims1[3]));
+    profile->setDimensions("input1", nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, dims1[1], dims1[2], dims1[3]));
+    profile->setDimensions("input1", nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4(max_batch_size, dims1[1], dims1[2], dims1[3]));
+    profile->setDimensions("input1", nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4(max_batch_size, dims1[1], dims1[2], dims1[3]));
+    const auto dims2 = inputDims[1].d;
+    profile->setDimensions("input2", nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, dims2[1], dims2[2], dims2[3]));
+    profile->setDimensions("input2", nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4(max_batch_size, dims2[1], dims2[2], dims2[3]));
+    profile->setDimensions("input2", nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims4(max_batch_size, dims2[1], dims2[2], dims2[3]));
     config->addOptimizationProfile(profile);
 
     auto serializedEngine = InferUniquePtr<nvinfer1::IHostMemory>(builder->buildSerializedNetwork(*network, *config));
@@ -125,16 +134,21 @@ void Inference::load_model(const char* filepath) {
         throw std::runtime_error("createExecutionContext");
     }
 
-    inputDims = engine->getBindingDimensions(0);
+    inputDims1 = engine->getBindingDimensions(0);
+    inputDims2 = engine->getBindingDimensions(1);
 }
 
-void Inference::forward(const int batch_size, float* x, float* y) {
-    inputDims.d[0] = batch_size;
-    context->setBindingDimensions(0, inputDims);
+void Inference::forward(const int batch_size, float* x1, float* x2, float* y1, float* y2) {
+    inputDims1.d[0] = batch_size;
+    inputDims2.d[0] = batch_size;
+    context->setBindingDimensions(0, inputDims1);
+    context->setBindingDimensions(1, inputDims2);
 
-    checkCudaErrors(cudaMemcpyAsync(x_dev, x, sizeof(public_features_t) * batch_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    checkCudaErrors(cudaMemcpyAsync(x1_dev, x1, sizeof(public_features_t) * batch_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    checkCudaErrors(cudaMemcpyAsync(x2_dev, x2, sizeof(private_features_t) * batch_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     const bool status = context->enqueue(batch_size, inputBindings.data(), cudaStreamPerThread, nullptr);
     assert(status);
-    checkCudaErrors(cudaMemcpyAsync(y, y_dev, sizeof(float) * N_ACTIONS * batch_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    checkCudaErrors(cudaMemcpyAsync(y1, y1_dev, sizeof(float) * N_ACTIONS * batch_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    checkCudaErrors(cudaMemcpyAsync(y2, y2_dev, sizeof(float) * batch_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     checkCudaErrors(cudaStreamSynchronize(cudaStreamPerThread));
 }

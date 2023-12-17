@@ -38,9 +38,9 @@ class PolicyHead(nn.Module):
         self.fc2 = nn.Linear(256, 121)
 
         # 補助タスク1
-        # 役 66(場風・自風はそれぞれ1、翻牌は牌別、ドラと裏ドラはそれぞれ10までカウント)
+        # 役 54(場風・自風はそれぞれ1、翻牌は牌別、ドラと裏ドラはそれぞれ4までカウント)
         self.fc1_aux1 = nn.Linear(channels * 9 * 4, 256)
-        self.fc2_aux1 = nn.Linear(256, 66)
+        self.fc2_aux1 = nn.Linear(256, 54)
 
         # 補助タスク2
         # 和了プレイヤー 4+流局1
@@ -78,11 +78,11 @@ class PolicyHead(nn.Module):
 
     def forward(self, x):
         p = self.forward_policy(x)
-        aux1 = self.forward_aux1(x)
-        aux2 = self.forward_aux2(x)
-        aux3 = self.forward_aux3(x)
+        p_aux1 = self.forward_aux1(x)
+        p_aux2 = self.forward_aux2(x)
+        p_aux3 = self.forward_aux3(x)
 
-        return p, aux1, aux2, aux3
+        return p, p_aux1, p_aux2, p_aux3
 
 class ValueHead(nn.Module):
     def __init__(self, channels, blocks):
@@ -104,6 +104,18 @@ class ValueHead(nn.Module):
         self.fc1_aux = nn.Linear(channels * 9 * 4, 256)
         self.fc2_aux = nn.Linear(256, 4)
 
+    def forward_value(self, x1, x2):
+        x = self.conv1(torch.cat((x1, x2), dim=1))
+        x = F.relu(x)
+        x = self.blocks(x)
+        x = x.flatten(1)
+
+        v = self.fc1(x)
+        v = F.relu(v)
+        v = self.fc2(v)
+
+        return v
+
     def forward(self, x1, x2):
         x = self.conv1(torch.cat((x1, x2), dim=1))
         x = F.relu(x)
@@ -114,13 +126,13 @@ class ValueHead(nn.Module):
         v = F.relu(v)
         v = self.fc2(v)
 
-        aux = self.fc1_aux(x)
-        aux = F.relu(aux)
-        aux = self.fc2_aux(aux)
+        v_aux = self.fc1_aux(x)
+        v_aux = F.relu(v_aux)
+        v_aux = self.fc2_aux(v_aux)
 
-        return v, aux
+        return v, v_aux
 
-class PolicyValueNet(nn.Module):
+class PolicyValueNetWithAux(nn.Module):
     def __init__(self, channels, blocks, value_blocks):
         super().__init__()
         # 方策の入力チャンネル
@@ -153,15 +165,15 @@ class PolicyValueNet(nn.Module):
         return x
 
     def forward(self, x1, x2):
-        x1 = self.extract_features(x1)
+        x = self.extract_features(x1)
 
         # Policy head
-        p = self.policy_head(x1.flatten(1))
+        p, p_aux1, p_aux2, p_aux3 = self.policy_head(x.flatten(1))
 
         # Value head
-        v = self.value_head(x1, x2)
+        v, v_aux = self.value_head(x, x2)
 
-        return p, v
+        return p, p_aux1, p_aux2, p_aux3, v, v_aux
 
 class PolicyNet(nn.Module):
     def __init__(self, pv_net):
@@ -172,3 +184,14 @@ class PolicyNet(nn.Module):
         x = self.pv_net.extract_features(x)
         p = self.pv_net.policy_head.forward_policy(x.flatten(1))
         return p
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, pv_net: PolicyValueNetWithAux):
+        super().__init__()
+        self.pv_net = pv_net
+
+    def forward(self, x1, x2):
+        x = self.pv_net.extract_features(x1)
+        p = self.pv_net.policy_head.forward_policy(x.flatten(1))
+        v = self.pv_net.value_head.forward_value(x, x2)
+        return p, v

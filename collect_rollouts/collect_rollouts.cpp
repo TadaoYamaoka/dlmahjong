@@ -1,6 +1,6 @@
 ﻿#include "../../cmajiang/src_cpp/game.h"
 #include "../../cmajiang/src_cpp/random.h"
-#include "../../cmajiang/src_cpp/paipu.h"
+#include "../../cmajiang/src_cpp/xiangting.h"
 
 #include "inference.h"
 
@@ -18,6 +18,12 @@
 #include <fstream>
 #include <functional>
 
+#include <zlib.h>
+
+// PPO Parameter
+float gamma = 0.99;
+float gae_lambda = 0.95;
+
 std::atomic<bool> stop = false;
 
 std::string get_current_datetime() {
@@ -34,9 +40,53 @@ std::string get_current_datetime() {
     return ss.str();
 }
 
-// 牌譜
-std::vector<Game::Paipu> paipu;
-std::mutex paipu_mutex;
+typedef float hupai_t[54];
+typedef float hule_player_t[5];
+typedef float tajia_tingpai_t[3][34];
+struct StepData {
+    public_features_t public_features;
+    private_features_t private_features;
+    Action action;
+    float value;
+    policy_t log_probs;
+    float advantage;
+    hupai_t hupai; // 役
+    hule_player_t hule_player; // 和了プレイヤー
+    tajia_tingpai_t tajia_tingpai; // 他家の待ち牌
+    float fenpei[4]; // 得点
+};
+
+typedef std::vector<StepData> RolloutData;
+typedef std::vector<RolloutData> RolloutBuffer;
+RolloutBuffer rollout_buffer;
+std::mutex rollout_buffer_mutex;
+
+std::ostream& operator<<(std::ostream& os, const StepData& step_data) {
+    os.write((const char*)step_data.public_features, sizeof(public_features_t));
+    os.write((const char*)step_data.private_features, sizeof(private_features_t));
+    const int64_t action = (int64_t)step_data.action;
+    os.write((const char*)&action, sizeof(action));
+    os.write((const char*)&step_data.value, sizeof(float));
+    os.write((const char*)step_data.log_probs, sizeof(policy_t));
+    os.write((const char*)&step_data.advantage, sizeof(float));
+    os.write((const char*)step_data.hupai, sizeof(hupai_t));
+    os.write((const char*)step_data.hule_player, sizeof(hule_player_t));
+    os.write((const char*)step_data.tajia_tingpai, sizeof(tajia_tingpai_t));
+    os.write((const char*)step_data.fenpei, sizeof(StepData::fenpei));
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const RolloutData& rollout_data) {
+    for (const auto& step_data : rollout_data)
+        os << step_data;
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const RolloutBuffer& rollout_buffer) {
+    for (const auto& rollout_data : rollout_buffer)
+        os << rollout_data;
+    return os;
+}
 
 struct ActionReply {
     Action action;
@@ -134,9 +184,9 @@ class PolicyInference : public Inference {
 public:
     PolicyInference(const char* filepath, const int max_batch_size) : Inference{ filepath, max_batch_size} {}
 
-    void forward(const int batch_size, public_features_t* features_batch, policy_t* policy_batch) {
+    void forward(const int batch_size, public_features_t* features1_batch, private_features_t* features2_batch, policy_t* policy_batch, float* value_batch) {
         std::lock_guard<std::mutex> lock(mutex);
-        Inference::forward(batch_size, (float*)features_batch, (float*)policy_batch);
+        Inference::forward(batch_size, (float*)features1_batch, (float*)features2_batch, (float*)policy_batch, value_batch);
     }
 
     int get_max_batch_size() const { return max_batch_size; }
@@ -145,13 +195,97 @@ private:
     std::mutex mutex;
 };
 
+void compute_advantage(Game& game, std::array<RolloutData, 4>& rollout_data) {
+    std::array<int, 4> fenpei{};
+    hupai_t player_hupai[4]{};
+    hule_player_t hule_player{};
+
+    if (game.status() == Game::Status::HULE) {
+        while (true) {
+            const auto& hule = game.defen_();
+            for (int l = 0; l < 4; l++)
+                fenpei[l] += hule.fenpei[l];
+            const auto player_id = game.player_id()[hule.menfeng];
+            auto& player_hupai_ = player_hupai[player_id];
+            for (const auto& hupai : hule.hupai) {
+                if (hupai.name >= Hupai::ZHUANGFENG && hupai.name < Hupai::MENFENG)
+                    player_hupai_[0] = 1;
+                else if (hupai.name >= Hupai::MENFENG && hupai.name < Hupai::FANPAI)
+                    player_hupai_[1] = 1;
+                else if (hupai.name >= Hupai::FANPAI && hupai.name < Hupai::BAOPAI)
+                    player_hupai_[2 + (int)(hupai.name - Hupai::FANPAI)] = 1;
+                else if (hupai.name == Hupai::BAOPAI) {
+                    for (int n = 0; n < std::min(hupai.fanshu, 4); n++)
+                        player_hupai_[3 + (int)(hupai.name - Hupai::BAOPAI) * 4 + n] = 1;
+                }
+                else if (hupai.name == Hupai::CHIBAOPAI) {
+                    for (int n = 0; n < std::min(hupai.fanshu, 3); n++)
+                        player_hupai_[7 + (int)(hupai.name - Hupai::BAOPAI) * 4 + n] = 1;
+                }
+                else if (hupai.name == Hupai::LIBAOPAI) {
+                    for (int n = 0; n < std::min(hupai.fanshu, 4); n++)
+                        player_hupai_[10 + (int)(hupai.name - Hupai::BAOPAI) * 4 + n] = 1;
+                }
+                else
+                    player_hupai_[14 + (int)(hupai.name - Hupai::LIZHI)] = 1;
+            }
+            hule_player[hule.menfeng] = 1;
+
+            if (game.hule_().size() == 0)
+                break;
+            game.next();
+        }
+    }
+    else {
+        // 流局
+        hule_player[4] = 1;
+    }
+
+    for (int player_id = 0; player_id < 4; player_id++) {
+        auto& player_rollout_data = rollout_data[player_id];
+        const auto lunban = game.player_lunban(player_id);
+        float last_gae_lam = 0;
+        for (int step = player_rollout_data.size() - 1; step >= 0; step--) {
+            const bool next_non_terminal = step != player_rollout_data.size() - 1;
+            const auto reward = next_non_terminal ? 0 : fenpei[lunban] / 12000.0f;
+            const auto next_value = next_non_terminal ? player_rollout_data[step + 1].value : 0;
+            const auto delta = reward + gamma * next_value - player_rollout_data[step].value;
+            last_gae_lam = delta + gamma * gae_lambda * next_non_terminal * last_gae_lam;
+            player_rollout_data[step].advantage = last_gae_lam;
+
+            // 役
+            std::copy(player_hupai[player_id], player_hupai[player_id] + sizeof(hupai_t) / sizeof(float), player_rollout_data[step].hupai);
+            // 和了プレイヤー
+            std::fill_n(player_rollout_data[step].hule_player, sizeof(hule_player_t) / sizeof(float), 0);
+            if (hule_player[4] == 1) {
+                player_rollout_data[step].hule_player[4] = 1;
+            }
+            else {
+                for (int l = 0; l < 4; l++) {
+                    if (hule_player[l] == 1) {
+                        player_rollout_data[step].hule_player[(lunban - l + 4) % 4] = 1;
+                    }
+                }
+            }
+            // 得点
+            for (int l = 0; l < 4; l++) {
+                player_rollout_data[step].fenpei[(lunban - l + 4) % 4] = fenpei[l] / 12000.0f;
+            }
+        }
+    }
+}
+
 void collect_rollouts(PolicyInference& inference, const int n_games) {
     std::vector<Game> games(n_games);
-    public_features_t* features_batch;
+    public_features_t* features1_batch;
+    private_features_t* features2_batch;
     policy_t* policy_batch;
+    float* value_batch;
     const auto max_batch_size = inference.get_max_batch_size();
-    checkCudaErrors(cudaHostAlloc((void**)&features_batch, sizeof(public_features_t) * max_batch_size, cudaHostAllocPortable));
+    checkCudaErrors(cudaHostAlloc((void**)&features1_batch, sizeof(public_features_t) * max_batch_size, cudaHostAllocPortable));
+    checkCudaErrors(cudaHostAlloc((void**)&features2_batch, sizeof(private_features_t) * max_batch_size, cudaHostAllocPortable));
     checkCudaErrors(cudaHostAlloc((void**)&policy_batch, sizeof(policy_t) * max_batch_size, cudaHostAllocPortable));
+    checkCudaErrors(cudaHostAlloc((void**)&value_batch, sizeof(float) * max_batch_size, cudaHostAllocPortable));
 
     struct GamePlayerIdTbl {
         int game_id;
@@ -159,6 +293,8 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
         std::vector<ActionReply> leagal_actions;
     };
     std::vector<GamePlayerIdTbl> game_player_id_tbl;
+
+    std::vector<std::array<RolloutData, 4>> game_player_rollout_data(n_games);
 
     std::random_device seed_gen;
     std::mt19937_64 mt(seed_gen());
@@ -168,7 +304,8 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
     while (!stop) {
         game_player_id_tbl.clear();
 
-        public_features_t* features = features_batch;
+        public_features_t* features1 = features1_batch;
+        private_features_t* features2 = features2_batch;
         for (int game_id = 0; game_id < n_games; game_id++) {
             auto& game = games[game_id];
 
@@ -198,22 +335,28 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
 
                 // 特徴量作成
                 const auto lunban = game.lunban();
-                std::fill_n((float*)features, sizeof(public_features_t) / sizeof(float), 0);
-                public_features(game, lunban, (channel_t*)features);
+                std::fill_n((float*)features1, sizeof(public_features_t) / sizeof(float), 0);
+                public_features(game, lunban, (channel_t*)features1);
                 // player id
-                fill_channel(&(*features)[N_CHANNELS_PUBLIC + player_id], 1);
+                fill_channel(&(*features1)[N_CHANNELS_PUBLIC + player_id], 1);
+                std::fill_n((float*)features2, sizeof(private_features_t) / sizeof(float), 0);
+                private_features(game, lunban, (channel_t*)features2);
 
-                features++;
+                features1++;
+                features2++;
             }
 
         }
 
         if (game_player_id_tbl.size() > 0) {
             // 推論(並列実行しているゲームの全プレイヤー分をまとめて推論)
-            inference.forward((const int)game_player_id_tbl.size(), features_batch, policy_batch);
+            inference.forward((const int)game_player_id_tbl.size(), features1_batch, features2_batch, policy_batch, value_batch);
 
             // 推論結果のpolicyからサンプリングして行動
+            features1 = features1_batch;
+            features2 = features2_batch;
             policy_t* policy = policy_batch;
+            float* value = value_batch;
             for (const auto& game_player_id : game_player_id_tbl) {
                 const int game_id = game_player_id.game_id;
                 const int player_id = game_player_id.player_id;
@@ -250,7 +393,33 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
                     game.reply(player_id, reply.msg, reply.arg);
                 }
 
+                // データ格納
+                auto& rollout_data = game_player_rollout_data[game_id][player_id];
+                auto& step_data = rollout_data.emplace_back();
+                std::copy((float*)features1, (float*)(features1 + 1), (float*)step_data.public_features);
+                std::copy((float*)features2, (float*)(features2 + 1), (float*)step_data.private_features);
+                step_data.action = action.action;
+                step_data.value = *value;
+                std::copy((float*)policy, (float*)(policy + 1), (float*)step_data.log_probs);
+
+                // 他家の待ち牌
+                std::fill_n((float*)step_data.tajia_tingpai, sizeof(tajia_tingpai_t) / sizeof(float), 0);
+                const auto player_lunban = game.player_lunban(player_id);
+                for (int l = 1; l < 4; l++) {
+                    const auto lunban = (player_lunban + l) % 4;
+                    // 待ち牌
+                    for (const auto& p : tingpai(game.shoupai_(lunban))) {
+                        const auto s = p[0];
+                        const int suit = index_of(s);
+                        const int n = p[1] == '0' ? 4 : p[1] - '1';
+                        step_data.tajia_tingpai[l - 1][9 * suit + n] = 1;
+                    }
+                }
+
+                features1++;
+                features2++;
                 policy++;
+                value++;
             }
         }
 
@@ -259,31 +428,56 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
             auto& game = games[game_id];
             game.next();
 
-            // ゲーム終了時、牌譜出力
-            if (game.status() == Game::Status::JIEJI) {
-                std::lock_guard<std::mutex> lock(paipu_mutex);
-                paipu.emplace_back(std::move(game.paipu()));
+            // 1局終了時
+            if (game.status() == Game::Status::HULE || game.status() == Game::Status::PINGJU) {
+                auto& game_rollout_data =  game_player_rollout_data[game_id];
+                compute_advantage(game, game_rollout_data);
+                std::lock_guard<std::mutex> lock(rollout_buffer_mutex);
+                for (auto& rollout_data : game_rollout_data)
+                    rollout_buffer.emplace_back(std::move(rollout_data));
             }
         }
     }
 
-    checkCudaErrors(cudaFreeHost(features_batch));
+    checkCudaErrors(cudaFreeHost(features1_batch));
+    checkCudaErrors(cudaFreeHost(features2_batch));
     checkCudaErrors(cudaFreeHost(policy_batch));
+    checkCudaErrors(cudaFreeHost(value_batch));
 }
 
-void output_paipu(const std::filesystem::path& path, const int id, const std::vector<Game::Paipu>& paipu_tmp) {
-    auto paipu_path = path;
-    paipu_path /= get_current_datetime() + "." + std::to_string(id) + ".paipu";
-    auto paipu_path_tmp = paipu_path;
-    paipu_path_tmp += ".tmp";
-    std::ofstream ofs(paipu_path_tmp, std::ios::binary);
+void output_rollout_buffer(const std::filesystem::path& path, const int id, const RolloutBuffer& rollout_buffer) {
+    auto rollout_buffer_path = path;
+    rollout_buffer_path /= get_current_datetime() + "." + std::to_string(id) + ".dat";
+    auto rollout_buffer_path_tmp = rollout_buffer_path;
+    rollout_buffer_path_tmp += ".tmp";
+    std::ofstream ofs(rollout_buffer_path_tmp, std::ios::binary);
     if (ofs) {
-        for (const auto& paipu_ : paipu_tmp) {
-            ofs << paipu_;
-        }
+        // 出力
+        std::stringstream ss(std::ios::binary | std::ios::in | std::ios::out);
+        ss << rollout_buffer;
+
+        // ストリームのサイズを求める
+        ss.seekg(0, std::ios::end);
+        std::streamsize size = ss.tellg();
+        ss.seekg(0, std::ios::beg);
+
+        // バイナリデータを格納するためのベクタを初期化
+        std::vector<unsigned char> data(size);
+
+        // データを読み込む
+        ss.read(reinterpret_cast<char*>(data.data()), size);
+
+        // zlibを使用して圧縮   
+        uLongf compressed_size = compressBound(data.size());
+        std::vector<unsigned char> compressed_data(compressed_size);
+        compress(compressed_data.data(), &compressed_size, data.data(), data.size());
+
+        // 圧縮データをファイルに保存
+        ofs.write(reinterpret_cast<const char*>(compressed_data.data()), compressed_size);
         ofs.close();
 
-        std::filesystem::rename(paipu_path_tmp, paipu_path);
+        // ファイル名変更
+        std::filesystem::rename(rollout_buffer_path_tmp, rollout_buffer_path);
     }
 }
 
@@ -365,17 +559,26 @@ int main(int argc, char** argv)
         // startファイルが作成されるまで待機
         auto startfile_path = path;
         startfile_path /= "start";
-        while (!std::filesystem::exists(startfile_path)) {
-            // ファイルが存在しない場合、待機
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        {
+            bool first = true;
+            while (!std::filesystem::exists(startfile_path)) {
+                if (first) {
+                    std::cout << "Waiting " << startfile_path.string().c_str() << std::endl;
+                    first = false;
+                }
+                // ファイルが存在しない場合、待機
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
 
         // モデル読み込み
         auto modelfile_path = path;
         modelfile_path /= modelfile;
+        std::cout << "Loading " << modelfile_path.string().c_str() << std::endl;
         PolicyInference inference{ modelfile_path.string().c_str() , max_batch_size};
 
         // 処理開始
+        std::cout << "Collecting rollouts " << path.string().c_str() << std::endl;
         std::vector<std::thread> workers;
         workers.reserve(n_threads);
         for (int i = 0; i < n_threads; i++)
@@ -388,12 +591,12 @@ int main(int argc, char** argv)
             // ファイルが存在しない場合、待機
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            // 牌譜出力
-            if (paipu.size() >= interval) {
-                paipu_mutex.lock();
-                auto paipu_tmp = std::move(paipu);
-                paipu_mutex.unlock();
-                output_paipu(path, id, paipu_tmp);
+            // 出力
+            if (rollout_buffer.size() >= interval) {
+                rollout_buffer_mutex.lock();
+                auto rollout_buffer_tmp = std::move(rollout_buffer);
+                rollout_buffer_mutex.unlock();
+                output_rollout_buffer(path, id, rollout_buffer_tmp);
             }
         }
 
@@ -404,8 +607,8 @@ int main(int argc, char** argv)
         }
         stop = false;
 
-        // 牌譜出力
-        output_paipu(path, id, paipu);
+        // 出力
+        output_rollout_buffer(path, id, rollout_buffer);
     }
 
     return 0;

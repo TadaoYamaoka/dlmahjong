@@ -524,3 +524,4 @@ MigrationBackup/
 FodyWeavers.xsd
 
 .vscode
+*.onnx
