@@ -175,15 +175,57 @@ class PolicyValueNetWithAux(nn.Module):
 
         return p, p_aux1, p_aux2, p_aux3, v, v_aux
 
+    def forward_policy(self, x):
+        x = self.extract_features(x)
+        p = self.policy_head.forward_policy(x.flatten(1))
+        return p
+
+    def forward_policy_value(self, x1, x2):
+        x = self.extract_features(x1)
+        p = self.policy_head.forward_policy(x.flatten(1))
+        v = self.value_head.forward_value(x, x2)
+        return p, v
+
+    @staticmethod
+    def log_prob(value, logits):
+        value, log_pmf = torch.broadcast_tensors(value, logits)
+        value = value[..., :1]
+        log_prob = log_pmf.gather(-1, value).squeeze(-1)
+        return log_prob
+
+    @staticmethod
+    def entropy(logits):
+        min_real = torch.finfo(logits.dtype).min
+        logits = torch.clamp(logits, min=min_real)
+        probs = F.softmax(logits, dim=-1)
+        p_log_p = logits * probs
+        return -p_log_p.sum(-1)
+
+    def evaluate_actions(self, public_features, private_features, actions):
+        logits, values = self.forward_policy_value(public_features, private_features)
+        # Normalize
+        logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+        log_prob = self.log_prob(actions, logits)
+        entropy = self.entropy(logits)
+        return values, log_prob, entropy
+
+    def evaluate_actions_with_aux(self, public_features, private_features, actions):
+        logits, p_aux1, p_aux2, p_aux3, values, v_aux = self.forward(public_features, private_features)
+        # Normalize
+        logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+        log_prob = self.log_prob(actions, logits)
+        entropy = self.entropy(logits)
+        return values, log_prob, entropy, p_aux1, p_aux2, p_aux3, v_aux
+
+
 class PolicyNet(nn.Module):
     def __init__(self, pv_net):
         super().__init__()
         self.pv_net = pv_net
 
     def forward(self, x):
-        x = self.pv_net.extract_features(x)
-        p = self.pv_net.policy_head.forward_policy(x.flatten(1))
-        return p
+        return self.pv_net.forward_policy(x)
+
 
 class PolicyValueNet(nn.Module):
     def __init__(self, pv_net: PolicyValueNetWithAux):
@@ -191,7 +233,4 @@ class PolicyValueNet(nn.Module):
         self.pv_net = pv_net
 
     def forward(self, x1, x2):
-        x = self.pv_net.extract_features(x1)
-        p = self.pv_net.policy_head.forward_policy(x.flatten(1))
-        v = self.pv_net.value_head.forward_value(x, x2)
-        return p, v
+        return self.pv_net.forward_policy_value(x1, x2)

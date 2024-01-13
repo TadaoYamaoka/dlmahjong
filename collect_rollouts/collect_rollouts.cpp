@@ -48,7 +48,7 @@ struct StepData {
     private_features_t private_features;
     Action action;
     float value;
-    policy_t log_probs;
+    policy_t logits;
     float advantage;
     hupai_t hupai; // 役
     hule_player_t hule_player; // 和了プレイヤー
@@ -67,7 +67,7 @@ std::ostream& operator<<(std::ostream& os, const StepData& step_data) {
     const int64_t action = (int64_t)step_data.action;
     os.write((const char*)&action, sizeof(action));
     os.write((const char*)&step_data.value, sizeof(float));
-    os.write((const char*)step_data.log_probs, sizeof(policy_t));
+    os.write((const char*)step_data.logits, sizeof(policy_t));
     os.write((const char*)&step_data.advantage, sizeof(float));
     os.write((const char*)step_data.hupai, sizeof(hupai_t));
     os.write((const char*)step_data.hule_player, sizeof(hule_player_t));
@@ -125,7 +125,7 @@ std::vector<ActionReply> get_leagal_actions(const Game& game, const int player_i
         }
         // 暗槓もしくは加槓
         for (const auto& m : game.get_gang_mianzi()) {
-            const int i = index_of(m[0]) * 10 + (m[1] == '0' ? 4 : m[1] - '1');
+            const int i = index_of(m[0]) * 9 + (m[1] == '0' ? 4 : m[1] - '1');
             leagal_actions.emplace_back(ActionReply{ Action::GANG_M1 + i, Game::Reply{ Game::Message::GANG, m } });
         }
         break;
@@ -400,7 +400,7 @@ void collect_rollouts(PolicyInference& inference, const int n_games) {
                 std::copy((float*)features2, (float*)(features2 + 1), (float*)step_data.private_features);
                 step_data.action = action.action;
                 step_data.value = *value;
-                std::copy((float*)policy, (float*)(policy + 1), (float*)step_data.log_probs);
+                std::copy((float*)policy, (float*)(policy + 1), (float*)step_data.logits);
 
                 // 他家の待ち牌
                 std::fill_n((float*)step_data.tajia_tingpai, sizeof(tajia_tingpai_t) / sizeof(float), 0);
@@ -498,7 +498,7 @@ int main(int argc, char** argv)
         ("games", "Number of parallel games", cxxopts::value<int>(n_games)->default_value("64"))
         ("threads", "Number of threads", cxxopts::value<int>(n_threads)->default_value("2"))
         ("id", "Process id", cxxopts::value<int>(id)->default_value("0"))
-        ("interval", "Output interval", cxxopts::value<int>(interval)->default_value("1000"))
+        ("interval", "Output interval", cxxopts::value<int>(interval)->default_value("4096"))
         ("h,help", "Print help")
         ;
         options.parse_positional({ "basedir", "modelfile" });

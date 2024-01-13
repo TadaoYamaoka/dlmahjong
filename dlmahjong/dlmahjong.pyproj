@@ -13,8 +13,9 @@
     <RootNamespace>dlmahjong</RootNamespace>
     <InterpreterId>CondaEnv|CondaEnv|mahjong</InterpreterId>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
-    <CommandLineArguments>R:\work</CommandLineArguments>
+    <CommandLineArguments>R:\work --n_rollout_steps 1000</CommandLineArguments>
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
+    <Environment>CUDA_LAUNCH_BLOCKING=1</Environment>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
