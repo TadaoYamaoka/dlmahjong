@@ -1,4 +1,5 @@
 import argparse
+import logging
 from typing import NamedTuple
 import glob
 import os
@@ -9,9 +10,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from cmajiang import N_CHANNELS_PUBLIC, N_CHANNELS_PRIVATE, N_ACTIONS
 from dlmahjong.model import PolicyValueNetWithAux
+from dlmahjong.checkpoint import load_checkpoint, save_checkpoint
+from dlmahjong.export import export_onnx
 
 
 parser = argparse.ArgumentParser()
@@ -22,6 +26,7 @@ parser.add_argument("--batch_size", type=int, default=64)
 parser.add_argument("--lr", type=float, default=3e-4)
 args = parser.parse_args()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s\t%(levelname)s\t%(message)s", datefmt="%Y/%m/%d %H:%M:%S")
 
 # PPO Parameter
 clip_range = 0.2
@@ -62,18 +67,31 @@ class RolloutDataset(Dataset):
         self.rollout_data = np.empty(0, StepData)
 
     def load(self, path):
+        logging.info(f"loading {path}")
         with open(path, "rb") as f:
             data = zlib.decompress(f.read())
         tmp = np.frombuffer(data, StepData)
         self.rollout_data = np.concatenate((self.rollout_data, tmp))
+
+    def calc_log_prob(self, batch_size, device):
+        self.log_prob = np.empty(len(self.rollout_data), np.float32)
+        with torch.inference_mode():
+            for i in range(0, len(self.rollout_data), batch_size):
+                batch = self.rollout_data[i:i+batch_size]
+                actions = torch.from_numpy(batch["action"]).to(device)
+                logits = torch.from_numpy(batch["logits"]).to(device)
+                log_prob = PolicyValueNetWithAux.log_prob(actions, logits)
+                self.log_prob[i:i+batch_size] = log_prob.to("cpu").detach().numpy()
+
 
     def __len__(self):
         return len(self.rollout_data)
 
     def __getitem__(self, idx):
         data = self.rollout_data[idx]
+        log_prob = self.log_prob[idx]
         
-        return data["public_features"], data["private_features"], data["action"], data["logits"], data["advantage"], data["advantage"] + data["value"], data["hupai"]
+        return data["public_features"], data["private_features"], data["action"], log_prob, data["advantage"], data["advantage"] + data["value"], data["hupai"]
 
 
 max_dir_num = -1
@@ -88,7 +106,7 @@ if max_dir_num < 0:
     path = os.path.join(args.basedir, str(max_dir_num))
     os.makedirs(path)
 
-# stopÉtÉ@ÉCÉãÇ™Ç†ÇÈèÍçáÅAéüÇÃÉfÉBÉåÉNÉgÉäÇ÷
+# stop„Éï„Ç°„Ç§„É´„Åå„ÅÇ„ÇãÂ†¥Âêà„ÄÅÊ¨°„ÅÆ„Éá„Ç£„É¨„ÇØ„Éà„É™„Å∏
 if os.path.exists(os.path.join(path, "stop")):
     max_dir_num += 1
     path = os.path.join(args.basedir, str(max_dir_num))
@@ -104,34 +122,50 @@ while True:
         dataset.load(data_path)
         processed.add(data_path)
 
-    # àÍíËêîÉfÅ[É^Ç™ó≠Ç‹Ç¡ÇΩÇÁäwèKäJén
+    # ‰∏ÄÂÆöÊï∞„Éá„Éº„Çø„ÅåÊ∫ú„Åæ„Å£„Åü„ÇâÂ≠¶ÁøíÈñãÂßã
     if len(dataset) >= args.n_rollout_steps:
         break
 
     time.sleep(3)
 
 
-rollout_buffer = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
+logging.info(f"rollout data size = {len(dataset)}")
 
-model = PolicyValueNetWithAux(channels=128, blocks=10, value_blocks=5)
+# stop„Éï„Ç°„Ç§„É´‰ΩúÊàê
+with open(os.path.join(path, "stop"), "w") as f:
+    pass
+
+logging.info(f"loading model {path}")
+model = PolicyValueNetWithAux()
 model.to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
+state = {
+    "global_step": 0
+}
+load_checkpoint(model, optimizer, state, path)
+
 bce_with_logits_loss = torch.nn.BCEWithLogitsLoss()
 
+
+logging.info("calculating log prob")
+dataset.calc_log_prob(args.batch_size, device)
+rollout_buffer = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
+
+
+writer = SummaryWriter()
+
 for epoch in range(args.n_epochs):
-    for public_features, private_features, actions, logits, advantages, returns, hupai in rollout_buffer:
+    logging.info(f"training epoch {epoch}")
+    for public_features, private_features, actions, old_log_prob, advantages, returns, hupai in rollout_buffer:
         public_features = public_features.to(device)
         private_features = private_features.to(device)
         actions = actions.to(device)
-        logits = logits.to(device)
+        old_log_prob = old_log_prob.to(device)
         advantages = advantages.to(device)
         returns = returns.to(device)
         hupai = hupai.to(device)
-
-        with torch.inference_mode():
-            old_log_prob = model.log_prob(actions, logits)
 
         values, log_prob, entropy, p_aux1, p_aux2, p_aux3, v_aux = model.evaluate_actions_with_aux(public_features, private_features, actions)
 
@@ -155,7 +189,7 @@ for epoch in range(args.n_epochs):
         # Entropy loss favor exploration
         entropy_loss = -torch.mean(entropy)
 
-        # ï‚èïÉ^ÉXÉN1 ñ
+        # Ë£úÂä©„Çø„Çπ„ÇØ1 ÂΩπ
         p_aux1_loss = bce_with_logits_loss(p_aux1, hupai)
 
         loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss + p_aux1_loss
@@ -166,3 +200,25 @@ for epoch in range(args.n_epochs):
         # Clip grad norm
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
+
+        state["global_step"] += 1
+
+        writer.add_scalar('loss', loss, state["global_step"])
+        writer.add_scalar('policy_loss', policy_loss, state["global_step"])
+        writer.add_scalar('entropy_loss', entropy_loss, state["global_step"])
+        writer.add_scalar('value_loss', value_loss, state["global_step"])
+        writer.add_scalar('p_aux1_loss', p_aux1_loss, state["global_step"])
+
+max_dir_num += 1
+path = os.path.join(args.basedir, str(max_dir_num))
+os.makedirs(path)
+
+# „ÉÅ„Çß„ÉÉ„ÇØ„Éù„Ç§„É≥„Éà‰øùÂ≠ò
+logging.info("saving checkpoint")
+save_checkpoint(model, optimizer, state, path)
+
+export_onnx(model, path, device=device)
+
+# start„Éï„Ç°„Ç§„É´‰ΩúÊàê
+with open(os.path.join(path, "start"), "w") as f:
+    pass

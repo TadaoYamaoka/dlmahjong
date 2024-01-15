@@ -26,7 +26,8 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="export_pv_net.py" />
+    <Compile Include="checkpoint.py" />
+    <Compile Include="export.py" />
     <Compile Include="model.py" />
     <Compile Include="train.py" />
   </ItemGroup>

@@ -133,7 +133,7 @@ class ValueHead(nn.Module):
         return v, v_aux
 
 class PolicyValueNetWithAux(nn.Module):
-    def __init__(self, channels, blocks, value_blocks):
+    def __init__(self, channels=128, blocks=10, value_blocks=5):
         super().__init__()
         # 方策の入力チャンネル
         # 状態 5(打牌、副露x3他家、副露)
